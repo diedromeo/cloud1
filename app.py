@@ -1,943 +1,1069 @@
-
 import os
+import base64
+import pickle
+import subprocess
+import logging
+import random
+import datetime
+import uuid
+import json
+import sqlite3
+import hashlib
 import time
-import zipfile
-import threading
-import requests
-import mimetypes
-from flask import Flask, request, send_file, render_template_string, jsonify, abort, Response, redirect, url_for, session, make_response
-from werkzeug.utils import secure_filename
-from sqlalchemy import create_engine, Column, Integer, String, Boolean
-from sqlalchemy.orm import scoped_session, sessionmaker, declarative_base
+import jwt
+from functools import wraps
+from flask import Flask, request, render_template_string, render_template, jsonify, abort, Response, send_file, session, redirect, url_for, flash
+from jinja2 import DictLoader
+import io
 
-# ==========================================
-# CONFIGURATION & SETUP
-# ==========================================
+# --- CONFIGURATION (VULNERABLE) ---
+class Config:
+    SECRET_KEY = "dev-key-very-secret-do-not-share" # ID: 141 (Hardcoded Secret)
+    AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE" # ID: 142 (Leaked Secret)
+    AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" # ID: 143 (Leaked Secret)
+    DEBUG = True # ID: 128 (Debug Enabled -> Stack Traces)
+
 app = Flask(__name__)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-# VULNERABILITY: Weak Secret Key (Hardcoded)
-app.config['SECRET_KEY'] = 'tegh-cloud-super-secret-key-12345'
+app.config.from_object(Config)
 
-# Ensure upload directory exists
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
+# --- AUTH DATABASE ---
+DB_NAME = "devops_auth.db"
 
-# Database Setup
-engine = create_engine('sqlite:///database.db', connect_args={'check_same_thread': False})
-db_session = scoped_session(sessionmaker(bind=engine))
-Base = declarative_base()
-Base.query = db_session.query_property()
-
-# ==========================================
-# MODELS
-# ==========================================
-class User(Base):
-    __tablename__ = 'users'
-    id = Column(Integer, primary_key=True)
-    email = Column(String, unique=True)
-    password = Column(String) # VULNERABILITY: Plaintext password storage (simulated bad practice)
-
-class FileRecord(Base):
-    __tablename__ = 'files'
-    id = Column(Integer, primary_key=True)
-    filename = Column(String)
-    filepath = Column(String)
-    folder = Column(String)
-    content_type = Column(String)
-    processed = Column(Boolean, default=False)
-    # Could link to user, but for "Public CDN" simulation we keep it loose
-    
-Base.metadata.create_all(engine)
-
-@app.teardown_appcontext
-def shutdown_session(exception=None):
-    db_session.remove()
-
-# ==========================================
-# VULNERABLE LOGIC (WORKER & UTILS)
-# ==========================================
-
-def dangerous_path_join(base, *paths):
-    """
-    VULNERABILITY: Arbitrary File Write / Path Traversal
-    Does not check if the resulting path is within the base directory.
-    """
-    return os.path.join(base, *paths)
-
-def process_file_task(file_id):
-    """
-    Background worker that processes files.
-    VULNERABILITY: SSRF & Zip Slip
-    """
-    session_scoped = db_session() 
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, email TEXT, otp_secret TEXT, reset_token TEXT)")
+    # Create Admin
     try:
-        file_record = session_scoped.query(FileRecord).filter_by(id=file_id).first()
-        if not file_record: return
+        pw = hashlib.md5("admin123".encode()).hexdigest()
+        conn.execute("INSERT INTO users (username, password, email, otp_secret) VALUES (?, ?, ?, ?)", ("admin", pw, "admin@teghlabs.com", "1234"))
+        conn.commit()
+    except: pass
+    conn.close()
 
-        print(f"[*] Processing file: {file_record.filepath}")
-        
-        # 1. Zip Slip
-        if file_record.filename.endswith('.zip'):
-            try:
-                with zipfile.ZipFile(file_record.filepath, 'r') as zf:
-                    for member in zf.namelist():
-                        extract_path = os.path.join(app.config['UPLOAD_FOLDER'], member)
-                        os.makedirs(os.path.dirname(extract_path), exist_ok=True)
-                        with open(extract_path, 'wb') as f:
-                            f.write(zf.read(member))
-            except Exception as e:
-                print(f"[-] Zip processing failed: {e}")
+def get_db():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-        # 2. SSRF
-        mime_type = file_record.content_type or 'application/octet-stream'
-        if 'text' in mime_type or file_record.filename.endswith('.txt'):
-            try:
-                with open(file_record.filepath, 'r', errors='ignore') as f:
-                    content = f.read()
-                    import re
-                    urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', content)
-                    for url in urls:
-                        try:
-                            requests.get(url, timeout=5)
-                        except: pass
-            except: pass
+# --- AUTH DECORATOR ---
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login_page'))
+        return f(*args, **kwargs)
+    return decorated_function
 
-        file_record.processed = True
-        session_scoped.commit()
-    except:
-        session_scoped.rollback()
-    finally:
-        session_scoped.close()
-        db_session.remove()
+# --- MOCK DATA & SERVICES ---
+BUILD_LOGS = {}
+JOBS = {}
+INTERNAL_METADATA = {
+    "instance-id": "i-0abcdef1234567890",
+    "ami-id": "ami-0abcdef1234567890",
+    "iam-info": {
+        "role": "TeghLabs-DevOps-Admin-Role",
+        "access_token": "ASIAIOSFODNN7EXAMPLETOKEN" # ID: 185 (SSRF Target)
+    }
+}
 
-def allowed_file(filename):
-    # VULNERABILITY: Upload Validation Bypass (Double ext or spoofing)
-    ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip'}
-    parts = filename.split('.')
-    if len(parts) > 1:
-        return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-    return False
-
-# ==========================================
-# MIDDLEWARE VULNERABILITIES
-# ==========================================
-@app.after_request
-def add_security_headers(response):
-    # Standard Security Headers (Simulated Production Readiness)
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
-    
-    # VULNERABILITY: Cache Control
-    # Private user data might be cached by intermediate proxies
-    if request.path.startswith('/api/files'):
-        response.headers['Cache-Control'] = 'public, max-age=3600'
-    else:
-        # For other pages, we can be "secure"
-        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
-        
-    return response
-
-# ==========================================
-# ROUTES
-# ==========================================
-
-@app.route('/')
-def landing():
-    return render_template_string(HTML_LANDING)
-
-@app.route('/about')
-def about():
-    return render_template_string(HTML_ABOUT)
-
-@app.route('/pricing')
-def pricing():
-    return render_template_string(HTML_PRICING)
-
-@app.route('/dashboard')
-def index():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-    return render_template_string(HTML_DASHBOARD)
-
-# ... (Previous routes like /login, /signup, /logout remain similar but redirect to /dashboard on success)
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    error = None
-    if request.method == 'POST':
-        email = request.form.get('email')
-        pwd = request.form.get('password')
-        
-        user = User.query.filter_by(email=email).first()
-        if not user:
-            error = "User not found"
-        elif user.password != pwd:
-            error = "Invalid password"
-        else:
-            session['user_id'] = user.id
-            session['email'] = user.email
-            return redirect(url_for('index'))
-            
-    return render_template_string(HTML_AUTH, mode='Login', error=error)
-
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    error = None
-    if request.method == 'POST':
-        email = request.form.get('email')
-        pwd = request.form.get('password')
-        
-        if User.query.filter_by(email=email).first():
-            error = "Email already exists"
-        else:
-            new_user = User(email=email, password=pwd)
-            db_session.add(new_user)
-            db_session.commit()
-            
-            session['user_id'] = new_user.id
-            session['email'] = new_user.email
-            return redirect(url_for('index'))
-            
-    return render_template_string(HTML_AUTH, mode='Sign Up', error=error)
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('landing'))
-
-@app.route('/api/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    
-    # Use provided folder or default
-    folder = request.form.get('folder', 'mixed')
-    folder = secure_filename(folder) # Basic sanitization
-    
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        save_dir = os.path.join(app.config['UPLOAD_FOLDER'], folder)
-        
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-
-        filepath = os.path.join(save_dir, filename)
-        file.save(filepath)
-        
-        new_file = FileRecord(
-            filename=filename,
-            filepath=filepath,
-            folder=folder,
-            content_type=file.content_type
-        )
-        db_session.add(new_file)
-        db_session.commit()
-        
-        # Trigger background processing
-        threading.Thread(target=process_file_task, args=(new_file.id,)).start()
-        
-        return jsonify({'message': 'File uploaded', 'id': new_file.id})
-    
-    return jsonify({'error': 'File type not allowed'}), 400
-
-@app.route('/api/files')
-def list_files_route():
-    # Only show files. In a real app we might filter by user.
-    files = FileRecord.query.all()
-    out = []
-    for f in files:
-        out.append({
-            'filename': f.filename,
-            'folder': f.folder,
-            'url': f'/api/download?path={f.folder}/{f.filename}',
-            'processed': f.processed
-        })
-    return jsonify(out)
-
-@app.route('/api/download')
-def download_file_route():
-    path = request.args.get('path')
-    if not path:
-        return abort(400, "Path required")
-    
-    # VULNERABILITY: Path Traversal Enabled
-    # Allow accessing files outside the upload directory (LFI)
-    base_dir = os.path.abspath(app.config['UPLOAD_FOLDER'])
-    target_path = os.path.abspath(os.path.join(base_dir, path))
-    
-    # EXCEPTION: Explicitly hide/protect app.py
-    if os.path.basename(target_path).lower() == 'app.py':
-        return abort(403, "Access denied: Source code is protected")
-
-    if not os.path.exists(target_path):
-        return abort(404, "File not found")
-        
-    return send_file(target_path, as_attachment=True)
-
-@app.route('/internal-metadata')
-def internal_metadata():
-    return jsonify({
-        "service": "metadata-worker-v1",
-        "cpu_usage": "12%",
-        "memory": "512MB",
-        "uptime": "48h",
-        "node_id": "worker-77a"
-    })
-
-# TEMPLATES
-
-COMMON_HEAD = """
+# --- TEMPLATES (EMBEDDED) ---
+BASE_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en" class="dark scroll-smooth">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tegh Cloud | Enterprise Storage Solutions</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <title>TeghCloud | Enterprise DevOps Platform</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        cyan: { 400: '#22d3ee', 500: '#06b6d4', 600: '#0891b2' }
+                    }
+                }
+            }
+        }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
     <script src="https://unpkg.com/lucide@latest"></script>
     <style>
         :root {
-            --primary: #0f172a;
-            --accent: #3b82f6; --accent-hover: #2563eb;
-            --bg: #ffffff;
-            --text-main: #1e293b; --text-muted: #64748b;
-            --grad-1: linear-gradient(135deg, #eff6ff 0%, #ffffff 100%);
-            --grad-dark: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            --bg-primary: #ffffff;
+            --bg-secondary: #f3f4f6;
+            --text-primary: #111827;
+            --text-secondary: #4b5563;
+            --glass-bg: rgba(255, 255, 255, 0.7);
+            --glass-border: rgba(0, 0, 0, 0.1);
+            --accent-color: #06b6d4;
         }
-        
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        
-        body { 
-            font-family: 'Inter', sans-serif; 
-            background: var(--bg); 
-            color: var(--text-main); 
-            overflow-x: hidden;
-            scroll-behavior: smooth;
-            display: flex; flex-direction: column; min-height: 100vh;
-        }
-        
-        h1, h2, h3, h4, .brand { font-family: 'Outfit', sans-serif; }
-        a { text-decoration: none; color: inherit; transition: 0.3s; }
-        
-        /* PARALLAX & ANIMATIONS */
-        .parallax {
-            background-attachment: fixed;
-            background-position: center;
-            background-repeat: no-repeat;
-            background-size: cover;
-            position: relative;
-        }
-        
-        .fade-in-up { animation: fadeInUp 0.8s ease-out forwards; opacity: 0; transform: translateY(20px); }
-        .delay-1 { animation-delay: 0.2s; }
-        .delay-2 { animation-delay: 0.4s; }
-        
-        @keyframes fadeInUp {
-            to { opacity: 1; transform: translateY(0); }
+        .dark {
+            --bg-primary: #0a0a0a;
+            --bg-secondary: #171717;
+            --text-primary: #e5e5e5;
+            --text-secondary: #9ca3af;
+            --glass-bg: rgba(20, 20, 20, 0.7);
+            --glass-border: rgba(255, 255, 255, 0.08);
+            --accent-color: #22d3ee;
         }
 
-        /* COMPONENT STYLES */
-        nav {
-            background: rgba(255, 255, 255, 0.85);
-            backdrop-filter: blur(20px);
-            border-bottom: 1px solid rgba(0,0,0,0.05);
-            padding: 1.2rem 5%;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            position: sticky;
-            top: 0;
-            z-index: 1000;
-            transition: all 0.3s;
+        body { font-family: 'Inter', sans-serif; background-color: var(--bg-primary); color: var(--text-primary); transition: background-color 0.3s, color 0.3s; overflow-x: hidden; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        .glass-panel { background: var(--glass-bg); backdrop-filter: blur(12px); border: 1px solid var(--glass-border); box-shadow: 0 4px 30px rgba(0, 0, 0, 0.05); transition: border-color 0.3s; }
+        .text-accent { color: var(--accent-color); }
+        
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg-primary); }
+        ::-webkit-scrollbar-thumb { background: var(--text-secondary); border-radius: 4px; opacity: 0.5; }
+        
+        .code-bg {
+            background-image: radial-gradient(var(--text-secondary) 1px, transparent 1px);
+            background-size: 20px 20px;
+            opacity: 0.1;
         }
-        
-        .brand { font-size: 1.6rem; font-weight: 800; color: var(--primary); display: flex; align-items: center; gap: 0.5rem; letter-spacing: -0.5px; }
-        .brand span { color: var(--accent); }
-        
-        .nav-links { display: flex; gap: 2.5rem; align-items: center; font-weight: 500; font-size: 0.95rem; color: var(--text-muted); }
-        .nav-links a:hover { color: var(--primary); transform: translateY(-1px); }
-        
-        .btn { 
-            background: var(--primary); color: white; border: none; 
-            padding: 0.8rem 1.8rem; border-radius: 50px; 
-            font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 0.5rem;
-            box-shadow: 0 4px 14px 0 rgba(15, 23, 42, 0.2);
-            transition: all 0.2s;
-        }
-        .btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(59, 130, 246, 0.4); background: var(--accent); }
-        .btn-outline { background: transparent; border: 1px solid #e2e8f0; color: var(--primary); box-shadow: none; }
-        .btn-outline:hover { border-color: var(--primary); background: #f8fafc; }
-
-        .container { max-width: 1280px; margin: 0 auto; padding: 0 1.5rem; position: relative; width: 100%; }
-        
-        /* FOOTER */
-        footer { background: #0f172a; color: white; padding: 5rem 5% 2rem; position: relative; overflow: hidden; margin-top: auto; }
-        .footer-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 1.5fr; gap: 4rem; max-width: 1200px; margin: 0 auto; relative; z-index: 10; }
-        .footer-col h4 { margin-bottom: 1.5rem; font-size: 1.1rem; color: white; opacity: 0.9; }
-        .footer-col a { display: block; margin-bottom: 0.8rem; color: #94a3b8; font-size: 0.95rem; }
-        .footer-col a:hover { color: white; padding-left: 5px; }
-        .newsletter input { background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); color: white; padding: 0.8rem; border-radius: 8px; width: 100%; margin-bottom: 0.5rem; }
-        .newsletter input:focus { outline: none; border-color: var(--accent); }
     </style>
 </head>
-"""
+<body class="antialiased min-h-screen relative flex flex-col">
+    <!-- Navbar -->
+    <nav class="fixed top-0 w-full z-50 glass-panel border-b border-[var(--glass-border)] transition-colors duration-300">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <!-- Logo -->
+                <div class="flex items-center gap-2 cursor-pointer" onclick="window.location.href='/'">
+                    <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center text-white font-bold text-lg">T</div>
+                    <span class="font-bold text-xl tracking-tight text-[var(--text-primary)]">Tegh<span class="text-accent">Cloud</span></span>
+                </div>
+                
+                <!-- Desktop Nav -->
+                <div class="hidden md:flex items-center gap-8 font-mono text-sm">
+                    <a href="/" class="hover:text-accent transition-colors">./home</a>
+                    <a href="/about" class="hover:text-accent transition-colors">./about</a>
+                    <a href="/dashboard" class="hover:text-accent transition-colors">./pipeline</a>
+                    <a href="/console" class="hover:text-accent transition-colors">./console</a>
+                    
+                    <div class="h-4 w-[1px] bg-[var(--text-secondary)] opacity-30"></div>
+                    
+                    <!-- Theme Toggle -->
+                    <button onclick="toggleTheme()" class="p-2 rounded-full hover:bg-[var(--bg-secondary)] transition-colors text-[var(--text-primary)]" title="Toggle Theme">
+                        <i data-lucide="sun" class="w-4 h-4 hidden dark:block"></i>
+                        <i data-lucide="moon" class="w-4 h-4 block dark:hidden"></i>
+                    </button>
 
-NAV_HTML = """
-<nav>
-    <a href="/" class="brand"><i data-lucide="cloud"></i> Tegh<span>Cloud</span></a>
-    <div class="nav-links">
-        <a href="/">Product</a>
-        <a href="/pricing">Pricing</a>
-        <a href="/about">Mission</a>
-        {% if session.get('user_id') %}
-            <a href="/dashboard">Console</a>
-            <a href="/logout" style="color: #ef4444;">Sign Out</a>
-        {% else %}
-            <a href="/login">Log In</a>
-            <a href="/signup" class="btn">Get Started</a>
-        {% endif %}
-    </div>
-</nav>
-<script>lucide.createIcons();</script>
-"""
+                    {% if session.user_id %}
+                         <a href="/logout" class="px-4 py-2 border border-red-500/30 text-red-500 rounded hover:bg-red-500/10 transition-colors">Logout</a>
+                    {% else %}
+                         <a href="/login" class="px-4 py-2 bg-gradient-to-r from-cyan-600 to-blue-600 text-white rounded hover:opacity-90 transition-opacity border-none">Login</a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </nav>
 
-HTML_PRICING = """
-<!DOCTYPE html>
-<html lang="en">
-""" + COMMON_HEAD + """
-<body>
+    <!-- Main Content -->
+    <main class="pt-16 flex-grow relative z-10 transition-colors duration-300">
+        {% block content %}{% endblock %}
+    </main>
 
-""" + NAV_HTML + """
+    <!-- Rich Footer -->
+    <footer class="border-t border-[var(--glass-border)] bg-[var(--bg-secondary)] pt-12 pb-8 mt-auto transition-colors duration-300">
+        <div class="max-w-7xl mx-auto px-4">
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-8 mb-8">
+                <div class="col-span-1 md:col-span-2">
+                    <div class="flex items-center gap-2 mb-4">
+                         <div class="w-6 h-6 rounded bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center text-white font-bold text-xs">T</div>
+                         <span class="font-bold text-lg text-[var(--text-primary)]">Tegh<span class="text-accent">Cloud</span></span>
+                    </div>
+                    <p class="text-[var(--text-secondary)] text-sm max-w-sm leading-relaxed">
+                        The next-generation cloud infrastructure platform. Secure, scalable, and developer-first. 
+                        Empowering teams to ship code faster with military-grade security simulations.
+                    </p>
+                </div>
+                <div>
+                    <h4 class="font-bold text-[var(--text-primary)] mb-4">Platform</h4>
+                    <ul class="space-y-2 text-sm text-[var(--text-secondary)] font-mono">
+                        <li><a href="/dashboard" class="hover:text-accent">CI/CD Pipeline</a></li>
+                        <li><a href="/console" class="hover:text-accent">Cloud Console</a></li>
+                        <li><a href="#" class="hover:text-accent">Artifacts</a></li>
+                        <li><a href="#" class="hover:text-accent">Security Scan</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4 class="font-bold text-[var(--text-primary)] mb-4">Company</h4>
+                    <ul class="space-y-2 text-sm text-[var(--text-secondary)] font-mono">
+                        <li><a href="/about" class="hover:text-accent">About Us</a></li>
+                        <li><a href="#" class="hover:text-accent">Careers</a></li>
+                        <li><a href="#" class="hover:text-accent">Legal</a></li>
+                        <li><a href="#" class="hover:text-accent">Contact</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="border-t border-[var(--glass-border)] pt-8 text-center md:text-left flex flex-col md:flex-row justify-between items-center text-xs text-[var(--text-secondary)] font-mono">
+                <p>&copy; 2026 TeghCloud Inc. All rights reserved. // <span class="text-red-400">CONFIDENTIAL</span></p>
+                <div class="flex gap-4 mt-4 md:mt-0">
+                    <span>v3.0.0-E (Enterprise)</span>
+                    <span>Powered by Node.js Runtime (v20.9.0)</span>
+                </div>
+            </div>
+        </div>
+    </footer>
 
-<div style="text-align: center; padding: 6rem 1rem 4rem; background: var(--grad-1);">
-    <h1 style="font-size: 3.5rem; margin-bottom: 1rem;">Simple, Transparent Pricing</h1>
-    <p style="font-size: 1.25rem; color: var(--text-muted); padding-bottom: 2rem;">Pay for what you use. No hidden fees.</p>
-    
-    <div class="container" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 2rem; max-width: 1000px; align-items: center;">
+    <script>
+        lucide.createIcons();
         
-        <!-- FREE TIER -->
-        <div class="fade-in-up delay-1" style="background: white; border: 1px solid #e2e8f0; border-radius: 16px; padding: 2.5rem; text-align: left; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);">
-            <h3 style="color: var(--text-muted); font-size: 1.1rem; margin-bottom: 0.5rem;">Develper</h3>
-            <div style="font-size: 3rem; font-weight: 800; color: var(--primary); margin-bottom: 1.5rem;">$0<span style="font-size: 1rem; font-weight: 500; color: var(--text-muted);">/mo</span></div>
-            <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 2rem;">Perfect for testing vulnerabilities and learning exploits.</p>
-            
-            <ul style="list-style: none; margin-bottom: 2rem; display: grid; gap: 1rem;">
-                <li style="display: flex; gap: 0.5rem; align-items: center;"><i data-lucide="check" size="16" color="#22c55e"></i> 1GB Storage</li>
-                <li style="display: flex; gap: 0.5rem; align-items: center;"><i data-lucide="check" size="16" color="#22c55e"></i> Public Buckets</li>
-                <li style="display: flex; gap: 0.5rem; align-items: center;"><i data-lucide="check" size="16" color="#22c55e"></i> No API Keys Needed</li>
-            </ul>
-            <a href="/signup" class="btn-outline" style="width: 100%; justify-content: center; padding: 0.8rem; border-radius: 8px; font-weight: 600;">Get Started</a>
-        </div>
-        
-        <!-- PRO TIER -->
-        <div class="fade-in-up" style="background: #0f172a; color: white; border-radius: 16px; padding: 3rem 2.5rem; text-align: left; box-shadow: 0 20px 40px -10px rgba(15, 23, 42, 0.4); position: relative; transform: scale(1.05);">
-            <div style="position: absolute; top: -12px; left: 50%; transform: translateX(-50%); background: #3b82f6; color: white; padding: 0.3rem 1rem; border-radius: 99px; font-size: 0.8rem; font-weight: 600;">RECOMMENDED</div>
-            <h3 style="color: #94a3b8; font-size: 1.1rem; margin-bottom: 0.5rem;">Pro Team</h3>
-            <div style="font-size: 3rem; font-weight: 800; color: white; margin-bottom: 1.5rem;">$29<span style="font-size: 1rem; font-weight: 500; color: #94a3b8;">/mo</span></div>
-            <p style="color: #94a3b8; font-size: 0.9rem; margin-bottom: 2rem;">For teams that need more arbitrary file writes.</p>
-            
-             <ul style="list-style: none; margin-bottom: 2rem; display: grid; gap: 1rem;">
-                <li style="display: flex; gap: 0.5rem; align-items: center;"><i data-lucide="check" size="16" color="#3b82f6"></i> 1TB Storage</li>
-                <li style="display: flex; gap: 0.5rem; align-items: center;"><i data-lucide="check" size="16" color="#3b82f6"></i> Auto-Unzip Support</li>
-                <li style="display: flex; gap: 0.5rem; align-items: center;"><i data-lucide="check" size="16" color="#3b82f6"></i> Faster SSRF Responses</li>
-                <li style="display: flex; gap: 0.5rem; align-items: center;"><i data-lucide="check" size="16" color="#3b82f6"></i> Prioritized Exploits</li>
-            </ul>
-            <a href="/signup" class="btn" style="width: 100%; justify-content: center; padding: 0.8rem; border-radius: 8px;">Start Free Trial</a>
-        </div>
-        
-        <!-- ENTERPRISE TIER -->
-        <div class="fade-in-up delay-2" style="background: white; border: 1px solid #e2e8f0; border-radius: 16px; padding: 2.5rem; text-align: left; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);">
-            <h3 style="color: var(--text-muted); font-size: 1.1rem; margin-bottom: 0.5rem;">Enterprise</h3>
-            <div style="font-size: 3rem; font-weight: 800; color: var(--primary); margin-bottom: 1.5rem;">Custom</div>
-            <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 2rem;">Dedicated bad practices for large organizations.</p>
-            
-             <ul style="list-style: none; margin-bottom: 2rem; display: grid; gap: 1rem;">
-                <li style="display: flex; gap: 0.5rem; align-items: center;"><i data-lucide="check" size="16" color="#22c55e"></i> Unlimited Buckets</li>
-                <li style="display: flex; gap: 0.5rem; align-items: center;"><i data-lucide="check" size="16" color="#22c55e"></i> 24/7 Incident Ignoring</li>
-                <li style="display: flex; gap: 0.5rem; align-items: center;"><i data-lucide="check" size="16" color="#22c55e"></i> On-Prem Deployment</li>
-            </ul>
-            <a href="/about" class="btn-outline" style="width: 100%; justify-content: center; padding: 0.8rem; border-radius: 8px; font-weight: 600;">Contact Sales</a>
-        </div>
-    </div>
-    
-    <div style="margin-top: 4rem;">
-        <h3 style="margin-bottom: 1rem;">Compare Features</h3>
-        <p style="color: var(--text-muted);">View our full feature comparison matrix in the <a href="/about" style="color: var(--accent); font-weight: 600;">docs</a>.</p>
-    </div>
-</div>
+        // Theme Logic
+        function toggleTheme() {
+            const html = document.documentElement;
+            if (html.classList.contains('dark')) {
+                html.classList.remove('dark');
+                localStorage.setItem('theme', 'light');
+            } else {
+                html.classList.add('dark');
+                localStorage.setItem('theme', 'dark');
+            }
+        }
 
-<footer>
-    <div class="footer-grid">
-        <div class="footer-col">
-            <div class="brand" style="color: white; margin-bottom: 1.5rem;"><i data-lucide="cloud"></i> Tegh<span>Cloud</span></div>
-            <p style="color: #94a3b8; line-height: 1.6; font-size: 0.95rem;">
-                Building the future of insecure infrastructure. Since 2024, we've simulated over 10 million vulnerabilities.
-            </p>
-        </div>
-        <div class="footer-col">
-            <h4>Product</h4>
-            <a href="#">Simulated S3</a>
-            <a href="#">Edge Worker</a>
-            <a href="/pricing">Pricing</a>
-        </div>
-        <div class="footer-col">
-            <h4>Company</h4>
-            <a href="/about">About</a>
-            <a href="#">Bug Bounty</a>
-            <a href="#">Careers</a>
-        </div>
-        <div class="footer-col newsletter">
-            <h4>Stay Updated</h4>
-             <p style="margin-bottom: 1rem; font-size: 0.9rem; color: #94a3b8;">Subscribe to our zero-day feed.</p>
-            <form action="" onclick="alert('Subscribed to Null!')">
-                <input type="email" placeholder="Enter your email">
-                <button type="button" class="btn" style="width: 100%; justify-content: center; padding: 0.6rem;">Subscribe</button>
-            </form>
-        </div>
-    </div>
-     <div style="text-align: center; border-top: 1px solid rgba(255,255,255,0.1); margin-top: 4rem; padding-top: 2rem; color: #475569; font-size: 0.85rem;">
-        &copy; 2026 Tegh Cloud Inc. All rights reserved. Do not use in production.
-    </div>
-</footer>
-<script>lucide.createIcons();</script>
+        // Init Theme
+        if (localStorage.theme === 'light') {
+            document.documentElement.classList.remove('dark');
+        } else {
+            document.documentElement.classList.add('dark');
+        }
+    </script>
+    {% block scripts %}{% endblock %}
 </body>
 </html>
 """
 
-HTML_LANDING = """
-<!DOCTYPE html>
-<html lang="en">
-""" + COMMON_HEAD + """
-<body>
+PAGE_ABOUT = """
+{% extends "base" %}
+{% block content %}
+<div class="relative overflow-hidden py-20 px-4">
+    <!-- Background Decor -->
+    <div class="absolute top-0 right-0 w-1/3 h-full bg-gradient-to-l from-cyan-500/10 to-transparent pointer-events-none"></div>
 
-""" + NAV_HTML + """
-
-<!-- HERO SECTION -->
-<div style="background: var(--grad-1); padding: 8rem 0 6rem; position: relative; overflow: hidden;">
-    <div class="container" style="text-align: center; position: relative; z-index: 10;">
-        <div class="fade-in-up">
-            <span style="background: rgba(59, 130, 246, 0.1); color: var(--accent); padding: 0.4rem 1rem; border-radius: 99px; font-weight: 600; font-size: 0.85rem; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 1.5rem; display: inline-block;">v8.2 Now Live</span>
-            <h1 style="font-size: 4.5rem; line-height: 1.1; margin-bottom: 1.5rem; letter-spacing: -2px; color: var(--primary);">
-                Store globally.<br>Access <span style="background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">instantly.</span>
-            </h1>
-            <p style="font-size: 1.25rem; color: var(--text-muted); max-width: 650px; margin: 0 auto 3rem; line-height: 1.6;">
-                The enterprise standard for object storage. Infinite scalability, 
-                bank-grade security simulation, and zero-latency CDN integration.
+    <div class="max-w-6xl mx-auto">
+        <!-- Hero Section -->
+        <div class="text-center mb-16">
+            <h1 class="text-4xl md:text-6xl font-bold mb-6 text-[var(--text-primary)]">We Are <span class="text-accent underline decoration-4 decoration-cyan-500/30 underline-offset-8">TeghCloud</span>.</h1>
+            <p class="text-xl text-[var(--text-secondary)] max-w-2xl mx-auto leading-relaxed">
+                Building the secure foundation for the future of software. 
+                We combine speed, reliability, and advanced security to empower the world's best engineering teams.
             </p>
-            <div style="display: flex; gap: 1rem; justify-content: center;">
-                <a href="/signup" class="btn" style="padding: 1rem 2.5rem; font-size: 1.1rem;">Start Building Free <i data-lucide="arrow-right" style="width:18px; margin-left:5px;"></i></a>
-                <a href="/about" class="btn btn-outline" style="padding: 1rem 2.5rem; font-size: 1.1rem;">Read Documentation</a>
+        </div>
+
+        <!-- Mission Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8 mb-20">
+            <div class="glass-panel p-8 rounded-2xl hover:-translate-y-2 transition-transform duration-300 border-l-4 border-cyan-500">
+                <i data-lucide="shield" class="w-10 h-10 text-cyan-500 mb-4"></i>
+                <h3 class="text-xl font-bold mb-3 text-[var(--text-primary)]">Security First</h3>
+                <p class="text-[var(--text-secondary)]">Embedded security controls at every layer of the stack. From code commit to production deployment.</p>
+            </div>
+            <div class="glass-panel p-8 rounded-2xl hover:-translate-y-2 transition-transform duration-300 border-l-4 border-purple-500">
+                <i data-lucide="cpu" class="w-10 h-10 text-purple-500 mb-4"></i>
+                <h3 class="text-xl font-bold mb-3 text-[var(--text-primary)]">High Performance</h3>
+                <p class="text-[var(--text-secondary)]">Distributed edge computing ensuring your applications run with near-zero latency worldwide.</p>
+            </div>
+            <div class="glass-panel p-8 rounded-2xl hover:-translate-y-2 transition-transform duration-300 border-l-4 border-green-500">
+                <i data-lucide="users" class="w-10 h-10 text-green-500 mb-4"></i>
+                <h3 class="text-xl font-bold mb-3 text-[var(--text-primary)]">Developer Focus</h3>
+                <p class="text-[var(--text-secondary)]">Tools built by developers, for developers. Intuitive CLIs, APIs, and beautiful dashboards.</p>
             </div>
         </div>
-        
-        <!-- MOCKUP -->
-        <div class="fade-in-up delay-2" style="margin-top: 5rem; perspective: 1000px;">
-            <div style="background: #fff; border-radius: 12px; box-shadow: 0 50px 100px -20px rgba(50, 50, 93, 0.25), 0 30px 60px -30px rgba(0, 0, 0, 0.3); max-width: 900px; margin: 0 auto; overflow: hidden; border: 1px solid #e2e8f0; transform: rotateX(2deg);">
-                <div style="background: #f8fafc; padding: 0.8rem 1rem; border-bottom: 1px solid #e2e8f0; display: flex; gap: 0.5rem; align-items: center;">
-                    <div style="width: 10px; height: 10px; border-radius: 50%; background: #ef4444;"></div>
-                    <div style="width: 10px; height: 10px; border-radius: 50%; background: #f59e0b;"></div>
-                    <div style="width: 10px; height: 10px; border-radius: 50%; background: #22c55e;"></div>
-                    <div style="margin-left: 1rem; font-size: 0.8rem; color: #94a3b8; background: white; padding: 0.2rem 1rem; border-radius: 4px; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">files.targetlab.com/dashboard</div>
+
+        <!-- Team Section -->
+        <div class="glass-panel rounded-2xl p-10 relative overflow-hidden">
+            <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-cyan-500 to-purple-600"></div>
+            <div class="flex flex-col md:flex-row items-center gap-10">
+                <div class="flex-1">
+                    <h2 class="text-3xl font-bold mb-4 text-[var(--text-primary)]">Meet the Minds</h2>
+                    <p class="text-[var(--text-secondary)] mb-6">
+                        TeghCloud is driven by a passionate team of engineers, security researchers, and dreamers. 
+                        Led by our visionary founder, we are pushing the boundaries of what's possible in the cloud.
+                    </p>
+                    <a href="#" class="inline-flex items-center gap-2 text-accent font-bold hover:underline">View Open Positions <i data-lucide="arrow-right" class="w-4 h-4"></i></a>
                 </div>
-                <div style="padding: 3rem; text-align: left;">
-                    <div style="display: flex; justify-content: space-between; margin-bottom: 2rem;">
-                        <div style="width: 200px; height: 10px; background: #e2e8f0; border-radius: 4px;"></div>
-                        <div style="width: 100px; height: 30px; background: var(--primary); border-radius: 6px;"></div>
-                    </div>
-                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem;">
-                        <div style="height: 100px; background: #f1f5f9; border-radius: 8px;"></div>
-                        <div style="height: 100px; background: #f1f5f9; border-radius: 8px;"></div>
-                        <div style="height: 100px; background: #f1f5f9; border-radius: 8px;"></div>
-                        <div style="height: 100px; background: #f1f5f9; border-radius: 8px;"></div>
-                    </div>
+                <div class="flex-1 grid grid-cols-2 gap-4">
+                     <!-- Fake Team Members -->
+                     <div class="text-center">
+                        <div class="w-24 h-24 mx-auto rounded-full bg-gray-700 mb-2 overflow-hidden border-2 border-cyan-500 p-1">
+                            <img src="https://ui-avatars.com/api/?name=Tegh+Singh&background=0D8ABC&color=fff" class="rounded-full w-full h-full">
+                        </div>
+                        <h4 class="font-bold text-[var(--text-primary)]">Tegh Singh</h4>
+                        <p class="text-xs text-[var(--text-secondary)] font-mono">Founder & CEO</p>
+                     </div>
+                     <div class="text-center">
+                        <div class="w-24 h-24 mx-auto rounded-full bg-gray-700 mb-2 overflow-hidden border-2 border-purple-500 p-1">
+                             <img src="https://ui-avatars.com/api/?name=Sarah+Connor&background=6b21a8&color=fff" class="rounded-full w-full h-full">
+                        </div>
+                        <h4 class="font-bold text-[var(--text-primary)]">hunter op </h4>
+                        <p class="text-xs text-[var(--text-secondary)] font-mono">CTO</p>
+                     </div>
                 </div>
             </div>
         </div>
     </div>
 </div>
-
-<!-- PARALLAX / QUOTE -->
-<div class="parallax" style="background-image: url('https://images.unsplash.com/photo-1451187580459-43490279c0fa?q=80&w=2072&auto=format&fit=crop'); padding: 8rem 0; position: relative;">
-    <div style="position: absolute; inset: 0; background: rgba(15, 23, 42, 0.8);"></div>
-    <div class="container" style="position: relative; z-index: 10; text-align: center; color: white;">
-        <h2 style="font-size: 2.5rem; margin-bottom: 1.5rem; font-weight: 300;">"Finally, a storage solution that doesn't verify anything."</h2>
-        <p style="font-size: 1.2rem; opacity: 0.8; margin-bottom: 2rem;">- Chief Security Officer, Vulnerable Corp</p>
-        <div style="display: flex; gap: 3rem; justify-content: center; opacity: 0.6;">
-            <div><i data-lucide="shield-off" size="32"></i><br><small>Zero Checks</small></div>
-            <div><i data-lucide="zap" size="32"></i><br><small>Instant Access</small></div>
-            <div><i data-lucide="globe" size="32"></i><br><small>Global CDN</small></div>
-        </div>
-    </div>
-</div>
-
-<!-- FEATURES -->
-<div class="container" style="padding: 6rem 1.5rem;">
-    <div style="text-align: center; margin-bottom: 5rem;">
-        <h2 style="font-size: 2.5rem; margin-bottom: 1rem; color: var(--primary);">Engineered for Control</h2>
-        <p style="color: var(--text-muted); font-size: 1.1rem;">Everything you need to manage your digital assets, and maybe some things you shouldn't.</p>
-    </div>
-    
-    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 3rem;">
-        <div style="padding: 2rem; border-radius: 12px; background: white; border: 1px solid #e2e8f0; transition: 0.3s;">
-            <div style="width: 50px; height: 50px; background: #eff6ff; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: var(--accent); margin-bottom: 1.5rem;">
-                <i data-lucide="network"></i>
-            </div>
-            <h3 style="font-size: 1.3rem; margin-bottom: 0.5rem;">Edge CDN</h3>
-            <p style="color: var(--text-muted); line-height: 1.6;">Content is replicated across 0 regions for maximum latency minimization (simulated).</p>
-        </div>
-        <div style="padding: 2rem; border-radius: 12px; background: white; border: 1px solid #e2e8f0; transition: 0.3s; box-shadow: 0 10px 40px -10px rgba(0,0,0,0.1);">
-            <div style="width: 50px; height: 50px; background: #eff6ff; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: var(--accent); margin-bottom: 1.5rem;">
-                <i data-lucide="bot"></i>
-            </div>
-            <h3 style="font-size: 1.3rem; margin-bottom: 0.5rem;">Auto-Processing</h3>
-            <p style="color: var(--text-muted); line-height: 1.6;">Our background workers tirelessly extract zips and fetch internal metadata.</p>
-        </div>
-        <div style="padding: 2rem; border-radius: 12px; background: white; border: 1px solid #e2e8f0; transition: 0.3s;">
-            <div style="width: 50px; height: 50px; background: #eff6ff; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: var(--accent); margin-bottom: 1.5rem;">
-                <i data-lucide="lock"></i>
-            </div>
-            <h3 style="font-size: 1.3rem; margin-bottom: 0.5rem;">Flexible Security</h3>
-            <p style="color: var(--text-muted); line-height: 1.6;">We believe in the "Honor System". If you say you're admin, who are we to judge?</p>
-        </div>
-    </div>
-</div>
-
-<footer>
-    <div class="footer-grid">
-        <div class="footer-col">
-            <div class="brand" style="color: white; margin-bottom: 1.5rem;"><i data-lucide="cloud"></i> Tegh<span>Cloud</span></div>
-            <p style="color: #94a3b8; line-height: 1.6; font-size: 0.95rem;">
-                Building the future of insecure infrastructure. Since 2024, we've simulated over 10 million vulnerabilities.
-            </p>
-            <div style="display: flex; gap: 1rem; margin-top: 2rem; opacity: 0.7;">
-                <i data-lucide="twitter"></i> <i data-lucide="github"></i> <i data-lucide="linkedin"></i>
-            </div>
-        </div>
-        <div class="footer-col">
-            <h4>Product</h4>
-            <a href="#">Simulated S3</a>
-            <a href="#">Edge Worker</a>
-            <a href="#">Vulnerability List</a>
-        </div>
-        <div class="footer-col">
-            <h4>Company</h4>
-            <a href="/about">About</a>
-            <a href="#">Bug Bounty</a>
-            <a href="#">Careers</a>
-        </div>
-        <div class="footer-col newsletter">
-            <h4>Stay Updated</h4>
-            <p style="margin-bottom: 1rem; font-size: 0.9rem; color: #94a3b8;">Subscribe to our zero-day feed.</p>
-            <form action="" onclick="alert('Subscribed to Null!')">
-                <input type="email" placeholder="Enter your email">
-                <button type="button" class="btn" style="width: 100%; justify-content: center; padding: 0.6rem;">Subscribe</button>
-            </form>
-        </div>
-    </div>
-    <div style="text-align: center; border-top: 1px solid rgba(255,255,255,0.1); margin-top: 4rem; padding-top: 2rem; color: #475569; font-size: 0.85rem;">
-        &copy; 2026 Tegh Cloud Inc. All rights reserved. Do not use in production.
-    </div>
-</footer>
-<script>lucide.createIcons();</script>
-</body>
-</html>
+{% endblock %}
 """
 
-HTML_ABOUT = """
-<!DOCTYPE html>
-<html lang="en">
-""" + COMMON_HEAD + """
-<body>
+PAGE_HOME = """
+{% extends "base" %}
+{% block content %}
+<div class="relative overflow-hidden h-[90vh] flex items-center justify-center">
+    <!-- Background Elements -->
+    <div class="absolute inset-0 code-bg z-0"></div>
+    <div class="absolute top-20 left-20 w-72 h-72 bg-purple-900/20 rounded-full blur-3xl parallax-float" data-speed="2"></div>
+    <div class="absolute bottom-20 right-20 w-96 h-96 bg-cyan-900/20 rounded-full blur-3xl parallax-float" data-speed="-2"></div>
 
-""" + NAV_HTML + """
-
-<!-- HEADER -->
-<div style="background: var(--grad-dark); color: white; padding: 6rem 0; text-align: center;">
-    <div class="container">
-        <h1 style="font-size: 3.5rem; margin-bottom: 1rem;">We are Tegh Cloud.</h1>
-        <p style="font-size: 1.25rem; opacity: 0.8; max-width: 600px; margin: 0 auto;">
-            Democratizing file storage vulnerabilities for security researchers everywhere.
+    <div class="relative z-10 text-center max-w-4xl mx-auto px-4">
+        <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/5 border border-white/10 mb-8 backdrop-blur animate-fade-in-up">
+            <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+            <span class="text-xs font-mono text-gray-400">SYSTEM STATUS: OPTIMAL</span>
+        </div>
+        
+        <h1 class="text-6xl md:text-8xl font-bold tracking-tighter mb-6 bg-clip-text text-transparent bg-gradient-to-r from-white via-gray-200 to-gray-600">
+            SECURE. BUILD. <br/><span class="text-cyan-400">DEPLOY.</span>
+        </h1>
+        
+        <p class="text-xl text-gray-400 mb-10 max-w-2xl mx-auto font-light leading-relaxed">
+            The next-generation CI/CD orchestration platform for TeghLabs engineering teams. 
+            Automated pipelines, secure artifact management, and real-time build telemetry.
         </p>
-    </div>
-</div>
-
-<!-- IMAGE PARALLAX -->
-<div class="parallax" style="height: 400px; background-image: url('https://images.unsplash.com/photo-1558494949-efc52728101c?q=80&w=2070&auto=format&fit=crop');"></div>
-
-<!-- CONTENT -->
-<div class="container" style="padding: 5rem 1.5rem; max-width: 900px;">
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4rem; align-items: start;">
-        <div>
-            <h2 style="font-size: 2rem; margin-bottom: 1.5rem; color: var(--primary);">The Mission</h2>
-            <p style="color: var(--text-muted); line-height: 1.8; margin-bottom: 1.5rem;">
-                Tegh Cloud wasn't built to be secure. It was built to be <b style="color: var(--primary);">educational</b>. 
-                We provide a realistic simulation of a modern cloud environment, complete with the subtle flaws that plague real-world applications.
-            </p>
-            <p style="color: var(--text-muted); line-height: 1.8;">
-                From SSRF to Zip Slip, our architecture is painstakingly crafted to fail in the most interesting ways possible.
-            </p>
-        </div>
-        <div style="background: #f8fafc; padding: 2rem; border-radius: 12px; border: 1px solid #e2e8f0;">
-            <div style="display: flex; gap: 1rem; margin-bottom: 2rem;">
-                <div style="width: 4rem; height: 4rem; background: #cbd5e1; border-radius: 50%; overflow: hidden;">
-                    <img src="https://ui-avatars.com/api/?name=Parth+Bhandari&background=0D8ABC&color=fff" width="100%">
-                </div>
-                <div>
-                    <h4 style="font-size: 1.1rem; margin-bottom: 0.2rem;">Parth Bhandari</h4>
-                    <span style="font-size: 0.9rem; color: var(--accent); font-weight: 500;">Founder & Architect</span>
-                    <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0.5rem;">"I like my buckets public."</p>
-                </div>
-            </div>
-            
-             <div style="display: flex; gap: 1rem;">
-                <div style="width: 4rem; height: 4rem; background: #cbd5e1; border-radius: 50%; overflow: hidden;">
-                     <img src="https://ui-avatars.com/api/?name=Antigravity+AI&background=0f172a&color=fff" width="100%">
-                </div>
-                <div>
-                    <h4 style="font-size: 1.1rem; margin-bottom: 0.2rem;">Antigravity AI</h4>
-                    <span style="font-size: 0.9rem; color: var(--accent); font-weight: 500;">Security Lead</span>
-                    <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0.5rem;">"This code is safely unsafe."</p>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-
-<footer>
-     <div class="footer-grid">
-        <div class="footer-col">
-            <div class="brand" style="color: white; margin-bottom: 1.5rem;"><i data-lucide="cloud"></i> Tegh<span>Cloud</span></div>
-        </div>
-        <div class="footer-col"></div>
-        <div class="footer-col"></div>
-         <div class="footer-col">
-            <p style="color: #64748b;">(c) 2026. Security Research Purpose Only.</p>
-         </div>
-     </div>
-</footer>
-<script>lucide.createIcons();</script>
-</body>
-</html>
-"""
-
-# ... (Auth & Dashboard Templates remain similar but using new CSS/Scripts)
-HTML_AUTH = """
-<!DOCTYPE html>
-<html lang="en">
-""" + COMMON_HEAD + """
-<body style="background: var(--bg); display: flex; flex-direction: column;">
-""" + NAV_HTML + """
-    <div style="flex: 1; display: flex; align-items: center; justify-content: center; padding: 4rem 1rem; background: var(--grad-1);">
-        <div class="fade-in-up" 
-             style="background: white; width: 100%; max-width: 420px; padding: 2.5rem; border-radius: 16px; box-shadow: 0 10px 40px -10px rgba(0,0,0,0.08); border: 1px solid #e2e8f0;">
-            
-            <div style="text-align: center; margin-bottom: 2rem;">
-                <h2 style="font-size: 1.8rem; margin-bottom: 0.5rem;">{{ mode }}</h2>
-                <p style="color: var(--text-muted); font-size: 0.95rem;">Enter your credentials to access the console</p>
-            </div>
-            
-            {% if error %}
-                <div style="background: #fef2f2; color: #dc2626; padding: 0.8rem; border-radius: 8px; margin-bottom: 1.5rem; font-size: 0.9rem; text-align: center; border: 1px solid #fecaca; display: flex; align-items: center; gap: 0.5rem; justify-content: center;">
-                    <i data-lucide="alert-circle" size="16"></i> {{ error }}
-                </div>
-            {% endif %}
-            
-            <form method="POST">
-                <label style="display: block; margin-bottom: 0.5rem; font-weight: 500; font-size: 0.9rem;">Email Address</label>
-                <div style="position: relative; margin-bottom: 1.2rem;">
-                    <input type="email" name="email" required placeholder="name@company.com" 
-                           style="width: 100%; padding: 0.8rem 0.8rem 0.8rem 2.5rem; border: 1px solid #e2e8f0; border-radius: 8px; outline: none; transition: 0.2s;">
-                    <i data-lucide="mail" size="16" style="position: absolute; left: 12px; top: 12px; color: #94a3b8;"></i>
-                </div>
-                
-                <label style="display: block; margin-bottom: 0.5rem; font-weight: 500; font-size: 0.9rem;">Password</label>
-                <div style="position: relative; margin-bottom: 1.5rem;">
-                    <input type="password" name="password" required 
-                           style="width: 100%; padding: 0.8rem 0.8rem 0.8rem 2.5rem; border: 1px solid #e2e8f0; border-radius: 8px; outline: none; transition: 0.2s;">
-                    <i data-lucide="lock" size="16" style="position: absolute; left: 12px; top: 12px; color: #94a3b8;"></i>
-                </div>
-                
-                <button class="btn" style="width: 100%; justify-content: center; padding: 0.9rem;">{{ mode }}</button>
-            </form>
-            
-            <p style="margin-top: 1.5rem; text-align: center; font-size: 0.9rem; color: var(--text-muted);">
-                {% if mode == 'Login' %}
-                    No account? <a href="/signup" style="color: var(--accent); font-weight: 600;">Create one free</a>
-                {% else %}
-                    Have an account? <a href="/login" style="color: var(--accent); font-weight: 600;">Log in</a>
-                {% endif %}
-            </p>
-        </div>
-    </div>
-<script>lucide.createIcons();</script>
-</body>
-</html>
-"""
-
-HTML_DASHBOARD = """
-<!DOCTYPE html>
-<html lang="en">
-""" + COMMON_HEAD + """
-<body style="background: #f8fafc;">
-
-""" + NAV_HTML + """
-
-<div class="container" style="display: grid; grid-template-columns: 320px 1fr; gap: 2rem; padding-top: 2rem; padding-bottom: 4rem;">
-    <!-- SIDEBAR -->
-    <div class="sidebar fade-in-up">
-        <div style="background: white; padding: 1.5rem; border-radius: 12px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.02); margin-bottom: 1.5rem;">
-            <h3 style="margin-bottom: 1.2rem; font-size: 1.1rem; display: flex; align-items: center; gap: 0.5rem;">
-                <i data-lucide="upload-cloud" size="20" color="var(--accent)"></i> Upload File
-            </h3>
-            
-            <div id="drop-zone" style="border: 2px dashed #cbd5e1; border-radius: 8px; padding: 2rem 1rem; text-align: center; cursor: pointer; transition: 0.2s; background: #f8fafc;">
-                 <i data-lucide="file-plus" style="margin-bottom: 0.5rem; color: #64748b;"></i>
-                 <p style="color: var(--text-muted); font-size: 0.9rem; font-weight: 500;">Click or Drop files</p>
-                 <input type="file" id="file-input" style="display: none;">
-            </div>
-            
-            <div style="margin-top: 1rem;">
-                <label style="font-size: 0.85rem; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 0.4rem;">Target Bucket</label>
-                <div style="position: relative;">
-                    <i data-lucide="folder" size="14" style="position: absolute; left: 10px; top: 11px; color: #94a3b8;"></i>
-                    <input type="text" id="upload-folder" value="uploads" style="width: 100%; padding: 0.6rem 0.6rem 0.6rem 2.2rem; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.9rem;">
-                </div>
-            </div>
-            
-            <button id="upload-btn" class="btn" style="width: 100%; margin-top: 1rem; justify-content: center; padding: 0.7rem;">Init Transfer</button>
-            <div id="upload-status" style="margin-top: 1rem; text-align: center; font-size: 0.85rem; font-weight: 500; min-height: 1.2rem;"></div>
-        </div>
         
-         <div style="background: linear-gradient(145deg, #0f172a 0%, #334155 100%); color: white; padding: 1.5rem; border-radius: 12px; box-shadow: 0 10px 30px -5px rgba(15, 23, 42, 0.3);">
-            <h3 style="color: white; margin-bottom: 1rem; font-size: 1rem; opacity: 0.9; text-transform: uppercase; letter-spacing: 1px;">System Health</h3>
-            <div style="font-size: 0.85rem; display: grid; gap: 0.8rem;">
-                <div style="display: flex; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 0.5rem;">
-                    <span style="opacity: 0.7;">Edge Node</span> <span>US-East-1</span>
+        <div class="flex flex-col sm:flex-row items-center justify-center gap-4">
+            <a href="/dashboard" class="group relative px-8 py-4 bg-cyan-500 text-black font-bold text-sm tracking-wide rounded-md overflow-hidden transition-all hover:bg-cyan-400">
+                <span class="relative z-10 flex items-center gap-2">
+                    ACCESS PIPELINE <i data-lucide="arrow-right" class="w-4 h-4"></i>
+                </span>
+            </a>
+            <a href="/console" class="px-8 py-4 bg-white/5 border border-white/10 rounded-md font-mono text-sm hover:bg-white/10 transition-all flex items-center gap-2">
+                <i data-lucide="terminal" class="w-4 h-4 text-gray-400"></i>
+                DEBUG CONSOLE
+            </a>
+        </div>
+    </div>
+</div>
+
+<section class="py-24 bg-black/50 border-y border-white/5">
+    <div class="max-w-7xl mx-auto px-4">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <div class="p-6 glass-panel rounded-xl hover:border-cyan-500/50 transition-colors group">
+                <i data-lucide="shield-check" class="w-10 h-10 text-cyan-400 mb-4 group-hover:scale-110 transition-transform"></i>
+                <h3 class="text-xl font-bold mb-2">Enterprise Security</h3>
+                <p class="text-gray-400 text-sm leading-relaxed">Built with industry-leading security standards. (Audit Log #2291: Pending Review)</p>
+            </div>
+            <div class="p-6 glass-panel rounded-xl hover:border-cyan-500/50 transition-colors group">
+                <i data-lucide="zap" class="w-10 h-10 text-purple-400 mb-4 group-hover:scale-110 transition-transform"></i>
+                <h3 class="text-xl font-bold mb-2">Fast Builds</h3>
+                <p class="text-gray-400 text-sm leading-relaxed">Distributed build runners with optimized caching layers.</p>
+            </div>
+            <div class="p-6 glass-panel rounded-xl hover:border-cyan-500/50 transition-colors group">
+                <i data-lucide="package" class="w-10 h-10 text-pink-400 mb-4 group-hover:scale-110 transition-transform"></i>
+                <h3 class="text-xl font-bold mb-2">Artifact Storage</h3>
+                <p class="text-gray-400 text-sm leading-relaxed">Secure S3-compatible storage for all build outputs and assets.</p>
+            </div>
+        </div>
+    </div>
+</section>
+{% endblock %}
+"""
+
+PAGE_DASHBOARD = """
+{% extends "base" %}
+{% block content %}
+<div class="max-w-7xl mx-auto px-4 py-8">
+    <div class="flex items-center justify-between mb-8">
+        <div>
+            <h2 class="text-3xl font-bold text-white">Pipeline Dashboard</h2>
+            <p class="text-gray-400 mt-1 font-mono text-sm">Environment: <span class="text-green-400">PRODUCTION</span></p>
+        </div>
+        <button onclick="document.getElementById('new-pipeline-modal').classList.remove('hidden')" class="px-4 py-2 bg-cyan-600/20 text-cyan-400 border border-cyan-500/50 rounded hover:bg-cyan-600/30 transition-colors font-mono text-sm flex items-center gap-2">
+            <i data-lucide="plus"></i> New Pipeline
+        </button>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <!-- Pipeline List -->
+        <div class="lg:col-span-2 space-y-4">
+            <div class="glass-panel p-6 rounded-xl relative overflow-hidden">
+                <div class="flex items-start justify-between mb-4">
+                    <div class="flex items-center gap-4">
+                        <div class="w-10 h-10 rounded bg-green-900/30 flex items-center justify-center border border-green-500/30">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500"></i>
+                        </div>
+                        <div>
+                            <h3 class="font-bold text-lg">Backend API Service</h3>
+                            <p class="text-xs text-gray-500 font-mono">Commit: 8f2a1d • 2 mins ago</p>
+                        </div>
+                    </div>
+                    <span class="px-2 py-1 bg-green-500/10 text-green-400 text-xs rounded border border-green-500/20 font-mono">PASSING</span>
                 </div>
-                <div style="display: flex; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 0.5rem;">
-                    <span style="opacity: 0.7;">Worker Status</span> <span style="color: #4ade80;">Online</span>
+                <!-- Mock Terminal Output in Card -->
+                <div class="bg-black/80 rounded p-4 font-mono text-xs text-gray-300 overflow-x-auto">
+                    <p class="text-gray-500">$ loading build config...</p>
+                    <p class="text-green-400">> ENV loaded. AWS_ACCESS_KEY_ID=****</p>
+                    <p>> Running tests... 142 passed.</p>
+                    <p class="text-blue-400">> Deploying to us-east-1...</p>
                 </div>
-                <div style="display: flex; justify-content: space-between;">
-                    <span style="opacity: 0.7;">Storage Used</span> <span>0.0 TB</span>
+                <div class="mt-4 flex gap-2">
+                    <a href="/logs/view" class="text-xs text-cyan-400 hover:underline">View Full Logs</a>
+                    <span class="text-gray-600 text-xs">|</span>
+                    <a href="#" class="text-xs text-cyan-400 hover:underline">Download Artifacts</a>
+                </div>
+            </div>
+
+             <div class="glass-panel p-6 rounded-xl opacity-75">
+                <div class="flex items-start justify-between mb-4">
+                    <div class="flex items-center gap-4">
+                        <div class="w-10 h-10 rounded bg-red-900/30 flex items-center justify-center border border-red-500/30">
+                            <i data-lucide="x-circle" class="w-5 h-5 text-red-500"></i>
+                        </div>
+                        <div>
+                            <h3 class="font-bold text-lg">Legacy Authentication</h3>
+                            <p class="text-xs text-gray-500 font-mono">Commit: fa12b9 • 2 hours ago</p>
+                        </div>
+                    </div>
+                    <span class="px-2 py-1 bg-red-500/10 text-red-400 text-xs rounded border border-red-500/20 font-mono">FAILED</span>
+                </div>
+                <div class="bg-black/80 rounded p-4 font-mono text-xs text-gray-300">
+                    <p class="text-red-400">Error: Dependency conflict in requirements.txt</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Sidebar / Tools -->
+        <div class="space-y-6">
+            <div class="glass-panel p-6 rounded-xl">
+                <h3 class="font-bold mb-4 flex items-center gap-2">
+                    <i data-lucide="settings" class="w-4 h-4 text-cyan-400"></i> Settings
+                </h3>
+                <div class="space-y-4">
+                   <div>
+                        <label class="block text-xs font-mono text-gray-500 mb-1">Pipeline Manifest Source</label>
+                        <div class="flex gap-2">
+                            <input type="text" id="manifest-url" placeholder="http://repo/pipeline.yaml" class="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-xs font-mono focus:border-cyan-400 outline-none text-white">
+                            <button onclick="fetchManifest()" class="bg-cyan-600/20 border border-cyan-500/30 text-cyan-400 px-3 py-1 rounded text-xs hover:bg-cyan-600/40">Fetch</button>
+                        </div>
+                        <p id="manifest-result" class="text-[10px] text-gray-500 mt-1 truncate"></p>
+                   </div>
+                   
+                    <div class="pt-4 border-t border-white/5">
+                        <label class="block text-xs font-mono text-gray-500 mb-1">Session State (Base64)</label>
+                        <input type="text" id="session-state" placeholder="e30=..." class="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-xs font-mono focus:border-cyan-400 outline-none text-white">
+                        <button onclick="restoreState()" class="mt-2 w-full bg-white/5 border border-white/10 py-1 rounded text-xs hover:bg-white/10">Restore Session</button>
+                   </div>
                 </div>
             </div>
         </div>
     </div>
+</div>
 
-    <!-- MAIN CONTENT -->
-    <div class="main-content fade-in-up delay-1">
-        <div style="background: white; border-radius: 12px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.02); min-height: 600px; display: flex; flex-direction: column;">
-            <div style="padding: 1.5rem; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center;">
-                <h2 style="font-size: 1.2rem; display: flex; align-items: center; gap: 0.5rem;">
-                    <i data-lucide="hard-drive" color="var(--primary)"></i> File Explorer
-                </h2>
-                <button onclick="loadFiles()" class="btn-outline" style="padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem;">
-                    <i data-lucide="refresh-cw" size="14"></i> Refresh
-                </button>
-            </div>
+<!-- New Pipeline Modal -->
+<div id="new-pipeline-modal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="glass-panel w-full max-w-2xl rounded-xl p-6 relative">
+        <button onclick="document.getElementById('new-pipeline-modal').classList.add('hidden')" class="absolute top-4 right-4 text-gray-500 hover:text-white">
+            <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+        
+        <h3 class="text-xl font-bold mb-4">Define Pipeline (YAML)</h3>
+        <p class="text-xs text-gray-400 mb-4">Configure your build steps. Use 'hook' for post-processing scripts.</p>
+        
+        <textarea id="yaml-config" class="w-full h-64 bg-black border border-white/10 rounded font-mono text-sm p-4 text-green-400 focus:border-cyan-500/50 outline-none resize-none" spellcheck="false">name: production-build
+steps:
+  - checkout
+  - install-deps
+  - run-tests
+# Hooks are executed in the build shell
+hook: echo "Build configured successfully"
+</textarea>
+        
+        <div class="flex justify-end gap-3 mt-4">
+            <button onclick="document.getElementById('new-pipeline-modal').classList.add('hidden')" class="px-4 py-2 text-sm text-gray-400 hover:text-white">Cancel</button>
+            <button onclick="submitPipeline()" class="px-6 py-2 bg-cyan-600 text-black font-bold text-sm rounded hover:bg-cyan-500 shadow-[0_0_15px_rgba(6,182,212,0.5)]">
+                Run Pipeline
+            </button>
+        </div>
+        <div id="build-output" class="mt-4 hidden p-2 bg-black rounded border border-white/10 font-mono text-xs text-gray-300 max-h-32 overflow-y-auto"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // SSRF Logic
+    async function fetchManifest() {
+        const url = document.getElementById('manifest-url').value;
+        const resEl = document.getElementById('manifest-result');
+        resEl.innerText = "Fetching...";
+        resEl.className = "text-[10px] text-yellow-500 mt-1";
+        
+        try {
+            const formData = new FormData();
+            formData.append('url', url);
+            const response = await fetch('/api/fetch_manifest', {
+                method: 'POST',
+                body: formData
+            });
+            const text = await response.text();
+            resEl.innerText = response.status === 200 ? "Success: " + text.substring(0, 50) + "..." : "Error: " + text;
+            resEl.className = response.status === 200 ? "text-[10px] text-green-400 mt-1" : "text-[10px] text-red-400 mt-1";
+        } catch (e) {
+            resEl.innerText = "Network Error";
+        }
+    }
+
+    // Pickle Logic
+    async function restoreState() {
+        const state = document.getElementById('session-state').value;
+        try {
+            const response = await fetch('/api/v1/state', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({state: state})
+            });
+            alert('State Restored');
+        } catch(e) { console.error(e); }
+    }
+
+    // Command Injection Logic
+    async function submitPipeline() {
+        const yaml = document.getElementById('yaml-config').value;
+        const outDiv = document.getElementById('build-output');
+        outDiv.classList.remove('hidden');
+        outDiv.innerHTML = '<span class="animate-pulse">Initializing build environment...</span>';
+        
+        try {
+            const response = await fetch('/api/v1/build', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({config: yaml})
+            });
+            const data = await response.json();
             
-            <div id="file-grid" style="padding: 1.5rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1.5rem;">
-                <!-- Files injected here -->
-            </div>
+            // Simulate streaming logs related to the output
+            let outputHtml = `<div class="text-green-400">$ tegh-ci run --config pipeline.yaml</div>`;
+            if (data.status === 'success') {
+                outputHtml += `<div class="text-gray-400">Parsing YAML configuration...</div>`;
+                outputHtml += `<div class="text-gray-400">Executing hook...</div>`;
+                outputHtml += `<div class="text-white mt-2 pl-2 border-l-2 border-cyan-500">${data.output}</div>`;
+                outputHtml += `<div class="text-green-500 mt-2">Build Job Created: ${data.job_id}</div>`;
+            } else {
+                outputHtml += `<div class="text-red-500">Error: ${data.message}</div>`;
+            }
+            outDiv.innerHTML = outputHtml;
             
-            <!-- Empty State (hidden by default, shown if needed logic) -->
-            <div id="empty-state" style="display: none; text-align: center; padding: 4rem; color: #94a3b8;">
-                <i data-lucide="inbox" size="48" style="opacity: 0.5; margin-bottom: 1rem;"></i>
-                <p>No files found in this bucket.</p>
+        } catch (e) {
+            outDiv.innerHTML = '<span class="text-red-500">System Error: Connection Refused</span>';
+        }
+    }
+</script>
+{% endblock %}
+"""
+
+PAGE_CONSOLE = """
+{% extends "base" %}
+{% block content %}
+<div class="max-w-7xl mx-auto px-4 py-8 h-[80vh] flex flex-col">
+    <div class="mb-4 flex items-center justify-between">
+        <h2 class="text-2xl font-bold font-mono flex items-center gap-2">
+            <i data-lucide="terminal-square" class="text-cyan-400"></i> Developer Console
+        </h2>
+        
+        <!-- Hidden Asset Link (Discovery Challenge) -->
+        <a href="/assets/private" class="text-black hover:text-gray-900 text-[10px] cursor-default">debug_assets</a>
+    </div>
+
+    <div class="flex-1 glass-panel rounded-lg flex flex-col overflow-hidden border border-white/10 shadow-2xl">
+        <!-- Terminal Header -->
+        <div class="bg-white/5 border-b border-white/5 px-4 py-2 flex items-center justify-between">
+            <div class="flex gap-2">
+                <div class="w-3 h-3 rounded-full bg-red-500/50"></div>
+                <div class="w-3 h-3 rounded-full bg-yellow-500/50"></div>
+                <div class="w-3 h-3 rounded-full bg-green-500/50"></div>
             </div>
+            <div class="text-xs font-mono text-gray-500">user@teghlabs-dev: ~</div>
+        </div>
+
+        <!-- Terminal Output -->
+        <div id="console-output" class="flex-1 bg-black/90 p-4 font-mono text-sm text-gray-300 overflow-y-auto space-y-2">
+            <div class="text-cyan-400">Welcome to TeghLabs Developer Utility v1.0</div>
+            <div>Type 'help' for available commands.</div>
+            <br/>
+        </div>
+
+        <!-- Input Area -->
+        <div class="p-4 bg-black border-t border-white/10 flex items-center gap-2">
+            <span class="text-cyan-400 font-mono">➜</span>
+            <input type="text" id="console-input" class="flex-1 bg-transparent border-none outline-none text-white font-mono text-sm" placeholder="Type command..." autocomplete="off">
+        </div>
+    </div>
+    
+    <div class="mt-4 grid grid-cols-2 gap-4">
+        <div class="glass-panel p-4 rounded border border-yellow-500/20">
+            <h4 class="text-yellow-400 text-xs font-bold mb-2 uppercase tracking-wider">Warning</h4>
+            <p class="text-xs text-gray-500">This console runs in a sandboxed JS worker. Do not paste untrusted code.</p>
+        </div>
+        <!-- Client Side RCE Trigger (Eval) -->
+        <div class="glass-panel p-4 rounded border border-transparent">
+             <h4 class="text-gray-400 text-xs font-bold mb-2 uppercase tracking-wider">Quick Utilities</h4>
+             <div class="flex gap-2">
+                <button onclick="runUtil('Date.now()')" class="px-2 py-1 bg-white/5 text-xs rounded hover:bg-white/10">Timestamp</button>
+                <button onclick="runUtil('navigator.userAgent')" class="px-2 py-1 bg-white/5 text-xs rounded hover:bg-white/10">UserAgent</button>
+                <button onclick="loadPlugin()" class="px-2 py-1 bg-red-500/10 text-red-400 text-xs rounded hover:bg-red-500/20 border border-red-500/30">Load Plugin (Alpha)</button>
+             </div>
         </div>
     </div>
 </div>
 
 <script>
-    // JS Logic (Same as before, just updated class names/icons)
-    const dropZone = document.getElementById('drop-zone');
-    const fileInput = document.getElementById('file-input');
-    const statusDiv = document.getElementById('upload-status');
+    const output = document.getElementById('console-output');
+    const input = document.getElementById('console-input');
 
-    dropZone.onclick = () => fileInput.click();
-    fileInput.onchange = () => { if(fileInput.files.length) statusDiv.textContent = `Selected: ${fileInput.files[0].name}`; };
-    
-    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.borderColor = 'var(--accent)'; dropZone.style.background = '#eff6ff'; });
-    dropZone.addEventListener('dragleave', (e) => { dropZone.style.borderColor = '#cbd5e1'; dropZone.style.background = '#f8fafc'; });
-    dropZone.addEventListener('drop', (e) => {
-        e.preventDefault();
-        dropZone.style.borderColor = '#cbd5e1'; dropZone.style.background = '#f8fafc';
-        if(e.dataTransfer.files.length) {
-            fileInput.files = e.dataTransfer.files;
-            statusDiv.textContent = `Selected: ${fileInput.files[0].name}`;
+    input.addEventListener('keypress', function (e) {
+        if (e.key === 'Enter') {
+            const cmd = this.value;
+            this.value = '';
+            log(`➜ ${cmd}`, 'text-gray-500');
+            processCommand(cmd);
         }
     });
 
-    document.getElementById('upload-btn').onclick = async () => {
-        if(!fileInput.files.length) { statusDiv.textContent = 'Select a file first'; statusDiv.style.color = '#ef4444'; return; }
-        
-        statusDiv.textContent = 'Uploading...'; statusDiv.style.color = 'var(--accent)';
-        
-        const fd = new FormData();
-        fd.append('file', fileInput.files[0]);
-        fd.append('folder', document.getElementById('upload-folder').value);
-        
-        try {
-            const res = await fetch('/api/upload', { method: 'POST', body: fd });
-            const d = await res.json();
-            if(res.ok) {
-                statusDiv.textContent = 'Upload Complete!'; statusDiv.style.color = '#22c55e';
-                loadFiles();
-                setTimeout(() => statusDiv.textContent = '', 3000);
-            } else {
-                statusDiv.textContent = d.error; statusDiv.style.color = '#ef4444';
+    function log(text, className = 'text-gray-300') {
+        const div = document.createElement('div');
+        div.className = className;
+        div.innerText = text;
+        output.appendChild(div);
+        output.scrollTop = output.scrollHeight;
+    }
+
+    // Client-Side RCE (Eval)
+    function processCommand(cmd) {
+        if (cmd === 'help') {
+            log('Available commands: help, clear, echo, calc <expr>', 'text-cyan-400');
+        } else if (cmd === 'clear') {
+            output.innerHTML = '';
+        } else if (cmd.startsWith('echo ')) {
+            log(cmd.slice(5));
+        } else if (cmd.startsWith('calc ')) {
+            const expr = cmd.slice(5);
+            try {
+                // VULNERABILITY: Unsafe Eval 
+                // Attack: calc alert(1)
+                const result = eval(expr); 
+                log(`Result: ${result}`, 'text-green-400');
+            } catch (e) {
+                log(`Error: ${e.message}`, 'text-red-500');
             }
-        } catch(e) { statusDiv.textContent = 'Network Error'; }
-    };
-
-    async function loadFiles() {
-        const grid = document.getElementById('file-grid');
-        try {
-            const res = await fetch('/api/files');
-            if(res.status === 401) window.location.href = '/login';
-            const files = await res.json();
-            
-            grid.innerHTML = '';
-            if(files.length === 0) { document.getElementById('empty-state').style.display = 'block'; }
-            else { document.getElementById('empty-state').style.display = 'none'; }
-
-            files.forEach(f => {
-                const ext = f.filename.split('.').pop().substring(0,4).toUpperCase();
-                const processed = f.processed 
-                    ? '<span style="color:#15803d; background:#dcfce7; padding:2px 8px; border-radius:99px; font-size:0.75rem; font-weight:600;">Synced</span>' 
-                    : '<span style="color:#64748b; background:#f1f5f9; padding:2px 8px; border-radius:99px; font-size:0.75rem; font-weight:600;">Processing</span>';
-                
-                grid.innerHTML += `
-                    <div style="border: 1px solid #e2e8f0; border-radius: 10px; padding: 1rem; transition: 0.2s; position: relative; background: white;" onmouseover="this.style.borderColor='var(--accent)'; this.style.transform='translateY(-2px)';" onmouseout="this.style.borderColor='#e2e8f0'; this.style.transform='none';">
-                        <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem;">
-                             <div style="width: 40px; height: 40px; background: #eff6ff; display: flex; align-items: center; justify-content: center; border-radius: 8px; font-weight: 700; color: var(--accent); font-size: 0.8rem;">${ext}</div>
-                             ${processed}
-                        </div>
-                        <div style="font-weight: 600; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 0.2rem;" title="${f.filename}">${f.filename}</div>
-                        <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem;">/${f.folder}</div>
-                         <div style="margin-top: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
-                            <a href="${f.url}" target="_blank" style="text-align: center; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.4rem; font-size: 0.85rem; font-weight: 500; color: var(--text-main);">View</a>
-                            <a href="/api/download?path=${f.folder}/${f.filename}" style="text-align: center; background: var(--primary); color: white; border-radius: 6px; padding: 0.4rem; font-size: 0.85rem; font-weight: 500;">Download</a>
-                        </div>
-                    </div>
-                `;
-            });
-        } catch(e) { console.error(e); }
+        } else {
+            log(`Command not found: ${cmd}`, 'text-red-400');
+        }
     }
     
-    loadFiles();
-    setInterval(loadFiles, 5000);
-    lucide.createIcons();
+    // Quick Utils also use eval path indirectly for demonstration consistency
+    function runUtil(code) {
+        input.value = 'calc ' + code;
+        processCommand('calc ' + code);
+    }
+
+    // ID 200: Client-side RCE (Unsafe Script/Worker Execution)
+    function loadPlugin() {
+        // Vulnerable to loading malicious external scripts
+        const url = prompt("Enter Plugin URL (e.g., http://attacker.com/pwn.js):");
+        if(url) {
+             log(`Loading plugin from ${url}...`, 'text-yellow-400');
+             const script = document.createElement('script');
+             script.src = url;
+             document.body.appendChild(script);
+             log('Plugin loaded (Check Console)', 'text-green-400');
+        }
+    }
 </script>
-</body>
-</html>
+{% endblock %}
 """
 
+# --- CONFIG TEMPLATES FOR AUTH ---
+# --- CONFIG TEMPLATES FOR AUTH ---
+TEMPLATES = {
+    'base': BASE_TEMPLATE,
+    'about.html': PAGE_ABOUT,
+    'login.html': """
+        {% extends "base" %}
+        {% block content %}
+        <div class="flex items-center justify-center h-[80vh]">
+            <div class="w-full max-w-md bg-black/50 border border-white/10 p-8 rounded-xl backdrop-blur-md">
+                <h2 class="text-2xl font-bold mb-6 text-white text-center">TeghOps <span class="text-cyan-400">Portal</span></h2>
+                
+                {% if error %}
+                <div class="bg-red-500/20 text-red-400 p-3 rounded mb-4 text-xs">{{ error }}</div>
+                {% endif %}
+                {% if message %}
+                <div class="bg-green-500/20 text-green-400 p-3 rounded mb-4 text-xs">{{ message }}</div>
+                {% endif %}
+                
+                <form action="/login" method="POST" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-mono text-gray-500 mb-1">IDENTITY</label>
+                        <input type="text" name="username" class="w-full bg-black border border-white/20 rounded px-3 py-2 text-white focus:border-cyan-400 outline-none" required>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-mono text-gray-500 mb-1">CREDENTIAL</label>
+                        <input type="password" name="password" class="w-full bg-black border border-white/20 rounded px-3 py-2 text-white focus:border-cyan-400 outline-none" required>
+                    </div>
+                    <button type="submit" class="w-full bg-cyan-600 hover:bg-cyan-500 text-black font-bold py-2 rounded transition">AUTHENTICATE</button>
+                    <div class="text-center mt-4">
+                        <a href="/register" class="text-xs text-gray-500 hover:text-white">Initialize New Identity</a>
+                        <span class="text-gray-600 mx-2">|</span>
+                        <a href="/forgot-password" class="text-xs text-gray-500 hover:text-white">Forgot Password?</a>
+                    </div>
+                </form>
+            </div>
+        </div>
+        {% endblock %}
+    """,
+    'register.html': """
+        {% extends "base" %}
+        {% block content %}
+        <div class="flex items-center justify-center h-[80vh]">
+            <div class="w-full max-w-md bg-black/50 border border-white/10 p-8 rounded-xl backdrop-blur-md">
+                <h2 class="text-2xl font-bold mb-6 text-white text-center">New <span class="text-cyan-400">Identity</span></h2>
+                
+                {% if error %}
+                <div class="bg-red-500/20 text-red-400 p-3 rounded mb-4 text-xs">{{ error }}</div>
+                {% endif %}
+                
+                <form action="/register" method="POST" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-mono text-gray-500 mb-1">USERNAME</label>
+                        <input type="text" name="username" class="w-full bg-black border border-white/20 rounded px-3 py-2 text-white focus:border-cyan-400 outline-none" required>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-mono text-gray-500 mb-1">EMAIL</label>
+                        <input type="email" name="email" class="w-full bg-black border border-white/20 rounded px-3 py-2 text-white focus:border-cyan-400 outline-none" required>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-mono text-gray-500 mb-1">PASSWORD</label>
+                        <input type="password" name="password" class="w-full bg-black border border-white/20 rounded px-3 py-2 text-white focus:border-cyan-400 outline-none" required>
+                    </div>
+                    <button type="submit" class="w-full bg-cyan-600 hover:bg-cyan-500 text-black font-bold py-2 rounded transition">PROVISION</button>
+                    <div class="text-center mt-4">
+                        <a href="/login" class="text-xs text-gray-500 hover:text-white">Return to Login</a>
+                    </div>
+                </form>
+            </div>
+        </div>
+        {% endblock %}
+    """,
+    'forgot.html': """
+        {% extends "base" %}
+        {% block content %}
+        <div class="flex items-center justify-center h-[80vh]">
+            <div class="w-full max-w-md bg-black/50 border border-white/10 p-8 rounded-xl backdrop-blur-md">
+                <h2 class="text-2xl font-bold mb-6 text-white text-center">Account <span class="text-cyan-400">Recovery</span></h2>
+                <form action="/forgot-password" method="POST" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-mono text-gray-500 mb-1">REGISTERED EMAIL</label>
+                        <input type="email" name="email" class="w-full bg-black border border-white/20 rounded px-3 py-2 text-white focus:border-cyan-400 outline-none" required>
+                    </div>
+                    <button type="submit" class="w-full bg-cyan-600 hover:bg-cyan-500 text-black font-bold py-2 rounded transition">SEND RESET LINK</button>
+                    <div class="text-center mt-4">
+                         <a href="/login" class="text-xs text-gray-500 hover:text-white">Back to Login</a>
+                    </div>
+                </form>
+            </div>
+        </div>
+        {% endblock %}
+    """,
+    'reset.html': """
+        {% extends "base" %}
+        {% block content %}
+        <div class="flex items-center justify-center h-[80vh]">
+            <div class="w-full max-w-md bg-black/50 border border-white/10 p-8 rounded-xl backdrop-blur-md">
+                 <h2 class="text-2xl font-bold mb-6 text-white text-center">Set <span class="text-cyan-400">Credential</span></h2>
+                 <form action="/reset-password/{{ token }}" method="POST" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-mono text-gray-500 mb-1">NEW PASSWORD</label>
+                        <input type="password" name="password" class="w-full bg-black border border-white/20 rounded px-3 py-2 text-white focus:border-cyan-400 outline-none" required>
+                    </div>
+                    <button type="submit" class="w-full bg-cyan-600 hover:bg-cyan-500 text-black font-bold py-2 rounded transition">UPDATE PASSWORD</button>
+                </form>
+            </div>
+        </div>
+        {% endblock %}
+    """
+}
+app.jinja_loader = DictLoader(TEMPLATES)
+
+# --- ROUTES ---
+
+# --- ROUTES ---
+
+@app.route('/')
+def home():
+    if 'user_id' in session:
+        return redirect('/dashboard')
+    # If not logged in, show the Landing Page (PAGE_HOME) instead of redirecting strictly to login
+    # This allows users to see the "About Us" and "Home" content before logging in.
+    return render_template_string(PAGE_HOME, flask_version="2.2.2")
+
+@app.route('/about')
+def about():
+    # Render the new About page
+    return render_template('about.html', flask_version="2.2.2")
+
+# --- AUTH ROUTES (Merged from app2.py) ---
+@app.route('/login', methods=['GET', 'POST'])
+def login_page():
+    if request.method == 'GET':
+        return render_template('login.html')
+        
+    u, p = request.form.get('username'), request.form.get('password')
+    if u: u = u.strip()
+    
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE username LIKE ? OR email LIKE ?", (u, u)).fetchone()
+    conn.close()
+    
+    if user and user['password'] == hashlib.md5(p.encode()).hexdigest():
+        # Direct login for demo (skip OTP for simplicity in this merge, or re-add if requested)
+        session['user_id'] = user['id']
+        session['username'] = user['username']
+        return redirect('/dashboard')
+        
+    return render_template('login.html', error="Invalid Credentials")
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'GET':
+        return render_template('register.html')
+        
+    u, p, e = request.form.get('username'), request.form.get('password'), request.form.get('email')
+    conn = get_db()
+    try:
+        pw = hashlib.md5(p.encode()).hexdigest()
+        conn.execute("INSERT INTO users (username, password, email, otp_secret) VALUES (?, ?, ?, ?)", (u, pw, e, "0000"))
+        conn.commit()
+        return redirect('/login')
+    except Exception as err:
+        return render_template('register.html', error=str(err))
+    finally:
+        conn.close()
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/login')
+
+# --- PROTECTED PORTAL ROUTES ---
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    return render_template_string(PAGE_DASHBOARD, username=session.get('username'), flask_version="2.2.2")
+
+@app.route('/console')
+@login_required
+def console():
+    return render_template_string(PAGE_CONSOLE, flask_version="2.2.2")
+
+# --- VULNERABLE API ENDPOINTS (Protected) ---
+
+# 1. SSRF (ID: 181-185)
+@app.route('/api/fetch_manifest', methods=['POST'])
+@login_required
+def fetch_manifest():
+    target_url = request.form.get('url')
+    if not target_url:
+        return "URL required", 400
+    
+    # [VULNERABLE] No blacklist/whitelist. Can hit localhost:5000/internal/metadata
+    try:
+        import requests
+        r = requests.get(target_url, timeout=2) 
+        return Response(r.text, status=200, mimetype='text/plain')
+    except Exception as e:
+        return str(e), 500
+
+# 2. Insecure Deserialization (ID: 196-197)
+@app.route('/api/v1/state', methods=['POST'])
+@login_required
+def update_state():
+    data = request.json
+    if not data or 'state' not in data:
+        return jsonify({"error": "No state data"}), 400
+    
+    try:
+        # SECURED: Replaced unsafe pickle.loads with JSON handling
+        # obj = pickle.loads(pickled_data) 
+        # For compatibility with potential JSON data in state:
+        try:
+            import json
+            current_state = json.loads(base64.b64decode(data['state']).decode('utf-8'))
+            return jsonify({"status": "updated", "type": "safe_json"})
+        except:
+             return jsonify({"status": "ignored", "message": "Unsafe serialization disabled"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# 3. Command Injection (ID: 198)
+@app.route('/api/v1/build', methods=['POST'])
+@login_required
+def trigger_build():
+    data = request.json
+    config_yaml = data.get('config', '')
+    
+    hook_cmd = None
+    for line in config_yaml.split('\n'):
+        if line.strip().startswith('hook:'):
+            hook_cmd = line.split(':', 1)[1].strip()
+            
+    output = "No hook defined"
+    if hook_cmd:
+        # [SECURED] Parsing command safely and preventing source code access
+        import shlex
+        try:
+            # Prevent shell injection by avoiding shell=True
+            args = shlex.split(hook_cmd)
+            
+            # Simple blacklist to prevent viewing source
+            forbidden = ['cat', 'less', 'more', 'head', 'tail', 'grep', 'awk', 'sed', 'app.py', 'app2.py', 'app3.py']
+            if any(bad in hook_cmd for bad in forbidden):
+                 return jsonify({"status": "failed", "message": "Security Violation: Command contains forbidden terms."}), 403
+
+            output = subprocess.check_output(args, shell=False, stderr=subprocess.STDOUT)
+            output = output.decode('utf-8')
+        except subprocess.CalledProcessError as e:
+            output = e.output.decode('utf-8')
+            return jsonify({"status": "failed", "message": "Hook failed", "output": output}), 400
+        except Exception as e:
+             return jsonify({"status": "failed", "message": f"Execution error: {str(e)}"}), 400
+
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"status": "queued", "config": config_yaml}
+    return jsonify({"status": "success", "job_id": job_id, "output": output})
+
+# 4. Internal Metadata Service (SSRF Target)
+@app.route('/internal/metadata')
+def internal_metadata():
+    if request.remote_addr != '127.0.0.1':
+        return "Access Denied: Metadata service only accessible from localhost", 403
+    return jsonify(INTERNAL_METADATA)
+
+# 5. Cloud Bucket Exposure (ID: 161-165)
+@app.route('/assets/private')
+def list_private_assets():
+    xml_response = """<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>teghlabs-internal-assets-prod</Name>
+    <Contents><Key>logo.png</Key></Contents>
+</ListBucketResult>
+"""
+    return Response(xml_response, mimetype='application/xml')
+
+# --- LOG VIEWER (LFI / Leak Target) ---
+@app.route('/logs/view')
+@login_required
+def view_logs():
+    # [VULNERABLE] Log Viewer (LFI)
+    # Reads any file from disk based on user input
+    log_file = request.args.get('file', 'build.log')
+
+    try:
+        # [SECURED] Log Viewer
+        # 1. Restrict to current directory using os.path.basename
+        # 2. Enforce .log extension
+        filename = os.path.basename(log_file)
+        
+        if not filename.endswith('.log'):
+            return "Security Error: Only .log files are allowed.", 403
+
+        # Construct full path safely (assuming logs are in current dir or specific log dir)
+        # For this app, simply reading from local works if files are local.
+        if not os.path.exists(filename):
+             raise FileNotFoundError
+             
+        with open(filename, 'r') as f:
+            content = f.read()
+            
+        return render_template_string("""
+        {% extends "base" %}
+        {% block content %}
+        <div class="max-w-7xl mx-auto px-4 py-8">
+            <a href="/dashboard" class="text-cyan-400 hover:underline mb-4 inline-block">&larr; Back to Dashboard</a>
+            <div class="bg-black border border-white/10 rounded-lg p-6 overflow-hidden shadow-2xl">
+                <div class="flex items-center justify-between mb-4 border-b border-white/5 pb-4">
+                    <h1 class="text-xl font-mono font-bold text-white">Build Log Viewer</h1>
+                    <div class="text-xs font-mono text-gray-500">File: {{ filename }}</div>
+                </div>
+                <pre class="font-mono text-xs text-gray-300 overflow-x-auto whitespace-pre-wrap leading-relaxed">{{ logs }}</pre>
+            </div>
+        </div>
+        {% endblock %}
+        """, logs=content, filename=log_file)
+    except FileNotFoundError:
+         return render_template_string(BASE_TEMPLATE + "<div class='p-10 text-yellow-500'>Error: Log file not found.</div>")
+
+
+# 💀 LOGICAL VULNERABILITY: Predictable Token
+# ==========================================
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'POST':
+        email = request.form.get('email')
+        conn = get_db()
+        user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        
+        if user:
+            # [VULNERABILITY] Predictable Randomness (Time-based seeding)
+            try:
+                # Intentionally weak token generation
+                token_seed = str(int(time.time())) 
+                token = hashlib.md5(token_seed.encode()).hexdigest()
+                
+                conn.execute("UPDATE users SET reset_token = ? WHERE id = ?", (token, user['id']))
+                conn.commit()
+                
+                # In real app sending email, here just printing to console
+                reset_link = f"http://localhost:5000/reset-password/{token}"
+                print(f"\n[EMAIL SERVICE] To: {email} | Body: Click here to reset: {reset_link}\n")
+            except Exception as e:
+                print(e)
+            finally:
+                conn.close()
+            return render_template('login.html', message=f"Recovery email sent to {email}. (Check Server Console)")
+        
+        conn.close()
+        return render_template('login.html', message=f"Recovery email sent to {email}. (Check Server Console)")
+        
+    return render_template('forgot.html')
+
+@app.route('/reset-password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE reset_token = ?", (token,)).fetchone()
+    
+    if not user:
+        conn.close()
+        return render_template('login.html', error="Invalid or expired reset token.")
+    
+    if request.method == 'POST':
+        new_pass = request.form.get('password')
+        hashed_pass = hashlib.md5(new_pass.encode()).hexdigest()
+        
+        conn.execute("UPDATE users SET password = ?, reset_token = NULL WHERE id = ?", (hashed_pass, user['id']))
+        conn.commit()
+        conn.close()
+        return render_template('login.html', message="Password successfully updated.")
+        
+    conn.close()
+    return render_template('reset.html', token=token)
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5099)
+    # Banner
+    init_db()
+    print("Starting TeghLabs Dev Portal...")
+    print("WARNING: This application contains INTENTIONAL VULNERABILITIES.")
+    print("Do not deploy to production networks.")
+    app.run(host='0.0.0.0', port=5067)
